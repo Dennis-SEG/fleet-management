@@ -46,9 +46,12 @@ export interface AdmissionDeps {
     factory: Pick<typeof ShellyDeviceFactory, 'fromWebsocket'> &
         Partial<Pick<typeof ShellyDeviceFactory, 'assembleFromGathered'>>;
     // Data gathered while the device waited, if any. Present → accept assembles
-    // from it (no re-fetch); absent → build over the socket, as before.
+    // from it (no re-fetch); absent → build over the socket, as before. The
+    // signal is the init slot's, so a reclaim ends the wait instead of leaving
+    // it pinned to a gather that may never land.
     takeGatheredData?: (
-        shellyID: string
+        shellyID: string,
+        opts?: {signal?: AbortSignal}
     ) => Promise<DeviceDataBundle | undefined>;
     deviceCollector: Pick<typeof DeviceCollector, 'register'>;
     auditLogger: Pick<typeof AuditLogger, 'log'>;
@@ -68,6 +71,10 @@ export interface AdmittedRegistrationInput {
     message: InitMessage;
     // Marks init phase for the slot watchdog, so a reclaim names where it stuck.
     setStage?: (stage: InitStage) => void;
+    // Aborted when the slot watchdog reclaims this init. Threaded into the
+    // gather wait and the probe RPCs so a reclaim actually unwinds the work,
+    // rather than freeing the slot while the build runs on underneath it.
+    signal?: AbortSignal;
 }
 
 // Top-level error wrapper. Pure error handling — no business logic.
@@ -107,7 +114,7 @@ async function runRegistration(
     input: AdmittedRegistrationInput,
     deps: AdmissionDeps
 ): Promise<boolean> {
-    const {session, admittedShellyID, message} = input;
+    const {session, admittedShellyID, message, signal} = input;
     const initStart = Date.now();
     const initialStatus = initialStatusFor(message);
 
@@ -121,7 +128,7 @@ async function runRegistration(
     const transport = session.transport ?? deps.buildTransport(session.ws);
     // Reuse the data gathered while the device waited, if any; otherwise gather
     // it now over the socket (a slow or early-accepted device just does it here).
-    const gathered = await deps.takeGatheredData?.(admittedShellyID);
+    const gathered = await deps.takeGatheredData?.(admittedShellyID, {signal});
     // Reuse should dominate; a spike in fresh probes means accepts are
     // outrunning the gather.
     const reusedGather = Boolean(gathered && deps.factory.assembleFromGathered);
@@ -133,7 +140,7 @@ async function runRegistration(
     const shelly =
         gathered && deps.factory.assembleFromGathered
             ? await deps.factory.assembleFromGathered(transport, gathered)
-            : await deps.factory.fromWebsocket(transport);
+            : await deps.factory.fromWebsocket(transport, signal);
 
     const mismatch = checkAdmittedIdentity(admittedShellyID, shelly.shellyID);
     if (mismatch !== null) {

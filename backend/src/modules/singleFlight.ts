@@ -39,6 +39,22 @@ export class SingleFlight<K, V> {
         return this.#inflight.get(key);
     }
 
+    /**
+     * Stop deduping onto the run for `key`. The run itself is untouched — it
+     * settles on its own — but the next caller starts a fresh one instead of
+     * joining a run whose result is no longer wanted (its socket is gone, its
+     * deadline has passed). Without this, one caller giving up leaves the
+     * entry behind for every later caller to join.
+     */
+    forget(key: K): void {
+        this.#inflight.delete(key);
+    }
+
+    /** Test-reset only: forget every key at once. */
+    clear(): void {
+        this.#inflight.clear();
+    }
+
     size(): number {
         return this.#inflight.size;
     }

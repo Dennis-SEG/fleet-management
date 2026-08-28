@@ -686,8 +686,10 @@ export default class ShellyWebsocketHandler extends AbstractWebsocketHandler {
         const transport = session.transport;
         const startedAt = Date.now();
         void runBoundedGather(async () => {
-            const bundle = await gatherDeviceDataOnce(shellyID, () =>
-                ShellyDeviceFactory.gatherDeviceData(transport)
+            // The signal carries the gather-wide deadline down into every
+            // probe RPC, so this task always frees its concurrency slot.
+            const bundle = await gatherDeviceDataOnce(shellyID, (signal) =>
+                ShellyDeviceFactory.gatherDeviceData(transport, signal)
             );
             ingressStage(
                 shellyID,
@@ -1058,7 +1060,8 @@ export default class ShellyWebsocketHandler extends AbstractWebsocketHandler {
                     session: ctx.session,
                     admittedShellyID: ctx.shellyID,
                     message: ctx.message,
-                    setStage: ctx.handle.setStage
+                    setStage: ctx.handle.setStage,
+                    signal: ctx.handle.signal
                 },
                 this.#admissionDeps
             );

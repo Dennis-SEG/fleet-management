@@ -82,6 +82,15 @@ function deriveMethodsFromSettings(settings: unknown): string[] {
     return Array.from(out);
 }
 
+// Every probe RPC gets a deadline of its own plus, when the caller passes one,
+// the gather-wide abort. Without the per-call deadline an RPC falls back to
+// the 60s stale sweep, and the paginated probes below multiply that by up to
+// 100 pages; without the gather-wide signal a reclaim can't unwind them.
+function probeSignal(signal?: AbortSignal): AbortSignal {
+    const perCall = AbortSignal.timeout(tuning.rpc.initProbeTimeoutMs);
+    return signal ? AbortSignal.any([signal, perCall]) : perCall;
+}
+
 export function shouldProbeVirtualComponents(methods: string[]): boolean {
     // Ask any device that can list its components. The advertised method list
     // is the single source of truth — no firmware-version or capability guess.
@@ -89,12 +98,12 @@ export function shouldProbeVirtualComponents(methods: string[]): boolean {
 }
 
 export default class ShellyDeviceFactory {
-    static fromHttp(transport: HttpTransport) {
-        return ShellyDeviceFactory.fromOnlineTransport(transport);
+    static fromHttp(transport: HttpTransport, signal?: AbortSignal) {
+        return ShellyDeviceFactory.fromOnlineTransport(transport, signal);
     }
 
-    static fromWebsocket(transport: WebSocketTransport) {
-        return ShellyDeviceFactory.fromOnlineTransport(transport);
+    static fromWebsocket(transport: WebSocketTransport, signal?: AbortSignal) {
+        return ShellyDeviceFactory.fromOnlineTransport(transport, signal);
     }
 
     static fromDatabase(entry: get_resp_t): ShellyDevice | undefined {
@@ -142,7 +151,8 @@ export default class ShellyDeviceFactory {
     }
 
     private static async getData(
-        transport: RpcTransport
+        transport: RpcTransport,
+        signal?: AbortSignal
     ): Promise<
         [
             info: any,
@@ -156,32 +166,31 @@ export default class ShellyDeviceFactory {
         // RPC can't drag the other 3 down. Per-call abort signal at 20s
         // (gRPC keepalive default) cuts hold time vs the 60s rpcTimeoutMs
         // fallback, so a slow device frees its init slot 3× faster.
-        const timeoutMs = tuning.rpc.initProbeTimeoutMs;
         const [infoRes, statusRes, configRes, methodsRes] =
             await Promise.allSettled([
                 transport.sendRPC(
                     'Shelly.GetDeviceInfo',
                     null,
                     false,
-                    AbortSignal.timeout(timeoutMs)
+                    probeSignal(signal)
                 ),
                 transport.sendRPC(
                     'Shelly.GetStatus',
                     null,
                     false,
-                    AbortSignal.timeout(timeoutMs)
+                    probeSignal(signal)
                 ),
                 transport.sendRPC(
                     'Shelly.GetConfig',
                     null,
                     false,
-                    AbortSignal.timeout(timeoutMs)
+                    probeSignal(signal)
                 ),
                 transport.sendRPC(
                     'Shelly.ListMethods',
                     null,
                     false,
-                    AbortSignal.timeout(timeoutMs)
+                    probeSignal(signal)
                 )
             ]);
         if (infoRes.status === 'rejected') throw infoRes.reason;
@@ -203,13 +212,17 @@ export default class ShellyDeviceFactory {
         return [info, status, config, deriveCapabilities(methods), methods];
     }
 
-    private static async fromOnlineTransport(transport: RpcTransport) {
+    private static async fromOnlineTransport(
+        transport: RpcTransport,
+        signal?: AbortSignal
+    ) {
         // Per-stage timing — a device that shows up slowly after accept is slow
         // in exactly one of these probe steps; the log below names which.
         const timer = new StageTimer();
         const bundle = await ShellyDeviceFactory.gatherOverTransport(
             transport,
-            timer
+            timer,
+            signal
         );
         return ShellyDeviceFactory.assembleOverTransport(
             transport,
@@ -224,10 +237,11 @@ export default class ShellyDeviceFactory {
     // be reused at accept. Marks the shared timer's probe stages.
     private static async gatherOverTransport(
         transport: RpcTransport,
-        timer: StageTimer
+        timer: StageTimer,
+        signal?: AbortSignal
     ): Promise<DeviceDataBundle> {
         const [info, status, config, capabilities, methods] =
-            await ShellyDeviceFactory.getData(transport);
+            await ShellyDeviceFactory.getData(transport, signal);
         timer.mark('probe');
 
         let componentPages = 0;
@@ -235,22 +249,27 @@ export default class ShellyDeviceFactory {
             componentPages = await addVirtualComponents(
                 transport,
                 status,
-                config
+                config,
+                signal
             );
         }
         timer.mark('components');
 
         // XT1 service devices: fetch service metadata (actions, errors, resources)
         if (capabilities.service) {
-            await fetchServiceMeta(transport, config);
+            await fetchServiceMeta(transport, config, signal);
         }
         timer.mark('service');
 
         // LedStrip: stash per-firmware catalogs so the UI renders dynamically.
-        await fetchLedStripMeta(transport, config);
+        await fetchLedStripMeta(transport, config, signal);
         timer.mark('ledstrip');
 
-        const eventCatalog = await fetchEventCatalog(transport, info.fw_id);
+        const eventCatalog = await fetchEventCatalog(
+            transport,
+            info.fw_id,
+            signal
+        );
         timer.mark('eventcatalog');
 
         return {
@@ -300,11 +319,13 @@ export default class ShellyDeviceFactory {
     // Gather device data over a live socket WITHOUT building the device, so the
     // waiting room can pre-warm the heavy fetch while a device sits idle.
     static gatherDeviceData(
-        transport: RpcTransport
+        transport: RpcTransport,
+        signal?: AbortSignal
     ): Promise<DeviceDataBundle> {
         return ShellyDeviceFactory.gatherOverTransport(
             transport,
-            new StageTimer()
+            new StageTimer(),
+            signal
         );
     }
 
@@ -346,16 +367,22 @@ const MAX_COMPONENT_PAGES = 100;
 async function addVirtualComponents(
     transport: RpcTransport,
     deviceStatus: any,
-    deviceConfig: any
+    deviceConfig: any,
+    signal?: AbortSignal
 ): Promise<number> {
     let offset = 0;
     let total = 0;
     let pages = 0;
     for (let pageIndex = 0; pageIndex < MAX_COMPONENT_PAGES; pageIndex++) {
-        const result = await transport.sendRPC('Shelly.GetComponents', {
-            offset,
-            dynamic_only: true
-        });
+        // Checked per page so a gather-wide deadline ends the loop here
+        // instead of after up to 100 more pages.
+        signal?.throwIfAborted();
+        const result = await transport.sendRPC(
+            'Shelly.GetComponents',
+            {offset, dynamic_only: true},
+            false,
+            probeSignal(signal)
+        );
         pages++;
         total = result.total;
         const components = result.components;
@@ -388,9 +415,16 @@ async function addVirtualComponents(
  * JWT and the JSON-RPC API both allow N > 0). Stored under each component's
  * own key in config so the entity composer surfaces per-service metadata.
  */
-async function fetchServiceMeta(transport: RpcTransport, deviceConfig: any) {
+async function fetchServiceMeta(
+    transport: RpcTransport,
+    deviceConfig: any,
+    signal?: AbortSignal
+) {
     for (const id of listServiceIds(deviceConfig)) {
-        await fetchOneServiceMeta(transport, deviceConfig, id);
+        // The helpers below swallow their own failures by design, so check
+        // here — otherwise a gather-wide abort wouldn't end the loop.
+        signal?.throwIfAborted();
+        await fetchOneServiceMeta(transport, deviceConfig, id, signal);
     }
 }
 
@@ -407,21 +441,34 @@ function listServiceIds(deviceConfig: Record<string, unknown>): number[] {
 async function fetchOneServiceMeta(
     transport: RpcTransport,
     deviceConfig: any,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<void> {
     const svcKey = `service:${id}`;
-    await safeFetchServiceInfo(transport, deviceConfig, svcKey, id);
-    await safeFetchServiceConfigOptions(transport, deviceConfig, svcKey, id);
+    await safeFetchServiceInfo(transport, deviceConfig, svcKey, id, signal);
+    await safeFetchServiceConfigOptions(
+        transport,
+        deviceConfig,
+        svcKey,
+        id,
+        signal
+    );
 }
 
 async function safeFetchServiceInfo(
     transport: RpcTransport,
     deviceConfig: any,
     svcKey: string,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<void> {
     try {
-        const info = await transport.sendRPC('Service.GetInfo', {id});
+        const info = await transport.sendRPC(
+            'Service.GetInfo',
+            {id},
+            false,
+            probeSignal(signal)
+        );
         if (!info || typeof info !== 'object') return;
         if (!deviceConfig[svcKey] || typeof deviceConfig[svcKey] !== 'object') {
             return;
@@ -443,10 +490,16 @@ async function safeFetchServiceConfigOptions(
     transport: RpcTransport,
     deviceConfig: any,
     svcKey: string,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<void> {
     try {
-        const opts = await transport.sendRPC('Service.ListConfigOptions', {id});
+        const opts = await transport.sendRPC(
+            'Service.ListConfigOptions',
+            {id},
+            false,
+            probeSignal(signal)
+        );
         if (!opts?.props || !Array.isArray(opts.props)) return;
         if (!deviceConfig[svcKey] || typeof deviceConfig[svcKey] !== 'object') {
             return;
@@ -512,12 +565,16 @@ export {MAX_CATALOG_PAGES};
 // Exported for tests only.
 export async function fetchEventCatalog(
     transport: RpcTransport,
-    fwId: string | undefined
+    fwId: string | undefined,
+    signal?: AbortSignal
 ): Promise<DeviceEventCatalog | undefined> {
     const pages = [];
     let offset = 0;
     for (let pageIndex = 0; pageIndex < MAX_CATALOG_PAGES; pageIndex++) {
-        const page = await safeFetchCatalogPage(transport, offset);
+        // safeFetchCatalogPage swallows failures, so an abort has to end the
+        // loop here rather than through its return value.
+        signal?.throwIfAborted();
+        const page = await safeFetchCatalogPage(transport, offset, signal);
         if (!page) {
             return pages.length > 0
                 ? buildEventCatalog({pages, nowMs: Date.now(), fwId})
@@ -551,12 +608,16 @@ function warnPartialCatalogIfShort(
 
 async function safeFetchCatalogPage(
     transport: RpcTransport,
-    offset: number
+    offset: number,
+    signal?: AbortSignal
 ): Promise<{types?: ReadonlyArray<any>; total?: number} | null> {
     try {
-        const resp = await transport.sendRPC('Webhook.ListAllSupported', {
-            offset
-        });
+        const resp = await transport.sendRPC(
+            'Webhook.ListAllSupported',
+            {offset},
+            false,
+            probeSignal(signal)
+        );
         if (!resp || typeof resp !== 'object') return null;
         return resp as {types?: ReadonlyArray<any>; total?: number};
     } catch (err) {
@@ -583,10 +644,18 @@ function errorMessage(err: unknown): string {
 
 async function fetchLedStripMeta(
     transport: RpcTransport,
-    deviceConfig: Record<string, any>
+    deviceConfig: Record<string, any>,
+    signal?: AbortSignal
 ): Promise<void> {
     for (const key of ledStripKeys(deviceConfig)) {
-        await loadCatalogForLedStrip(transport, {config: deviceConfig, key});
+        // Same reason as the service loop: the catalog fetch below is
+        // best-effort, so the abort check belongs here.
+        signal?.throwIfAborted();
+        await loadCatalogForLedStrip(
+            transport,
+            {config: deviceConfig, key},
+            signal
+        );
     }
 }
 
@@ -618,12 +687,13 @@ interface ArrayFetchSpec {
 
 async function loadCatalogForLedStrip(
     transport: RpcTransport,
-    target: Omit<LedStripTarget, 'id'>
+    target: Omit<LedStripTarget, 'id'>,
+    signal?: AbortSignal
 ): Promise<void> {
     const id = parseComponentId(target.key);
     if (id === null) return;
     const fullTarget: LedStripTarget = {...target, id};
-    const catalog = await fetchLedStripCatalog(transport, id);
+    const catalog = await fetchLedStripCatalog(transport, id, signal);
     if (catalogIsEmpty(catalog)) return;
     stashCatalogOnConfig(fullTarget, catalog);
     stashUiFieldsOnConfig(fullTarget, {
@@ -634,20 +704,21 @@ async function loadCatalogForLedStrip(
 
 async function fetchLedStripCatalog(
     transport: RpcTransport,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<LedStripCatalog> {
     const [protocols, palettes, effects] = await Promise.all([
-        safeFetchArrayField(transport, {
-            id,
-            method: 'LedStrip.ListAllProtocols',
-            field: 'protocols'
-        }),
-        safeFetchArrayField(transport, {
-            id,
-            method: 'LedStrip.ListAllPalettes',
-            field: 'palettes'
-        }),
-        safeFetchAllEffects(transport, id)
+        safeFetchArrayField(
+            transport,
+            {id, method: 'LedStrip.ListAllProtocols', field: 'protocols'},
+            signal
+        ),
+        safeFetchArrayField(
+            transport,
+            {id, method: 'LedStrip.ListAllPalettes', field: 'palettes'},
+            signal
+        ),
+        safeFetchAllEffects(transport, id, signal)
     ]);
     return {
         protocols: protocols as string[] | undefined,
@@ -658,10 +729,16 @@ async function fetchLedStripCatalog(
 
 export async function safeFetchArrayField(
     transport: RpcTransport,
-    spec: ArrayFetchSpec
+    spec: ArrayFetchSpec,
+    signal?: AbortSignal
 ): Promise<unknown[] | undefined> {
     try {
-        const r = await transport.sendRPC(spec.method, {id: spec.id});
+        const r = await transport.sendRPC(
+            spec.method,
+            {id: spec.id},
+            false,
+            probeSignal(signal)
+        );
         const value = (r as Record<string, unknown>)?.[spec.field];
         return Array.isArray(value) ? value : undefined;
     } catch (err) {
@@ -672,10 +749,11 @@ export async function safeFetchArrayField(
 
 async function safeFetchAllEffects(
     transport: RpcTransport,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<unknown[] | undefined> {
     try {
-        return await paginateEffects(transport, id);
+        return await paginateEffects(transport, id, signal);
     } catch (err) {
         warnIfUnexpected('LedStrip.ListAllEffects', id, err);
         return undefined;
@@ -688,12 +766,13 @@ export const MAX_EFFECT_PAGES = 100;
 
 export async function paginateEffects(
     transport: RpcTransport,
-    id: number
+    id: number,
+    signal?: AbortSignal
 ): Promise<unknown[]> {
     const collected: unknown[] = [];
     let offset = 0;
     for (let pageIndex = 0; pageIndex < MAX_EFFECT_PAGES; pageIndex++) {
-        const page = await fetchEffectPage(transport, {id, offset});
+        const page = await fetchEffectPage(transport, {id, offset}, signal);
         if (page.length === 0) return collected;
         collected.push(...page);
         offset += page.length;
@@ -710,9 +789,15 @@ export async function paginateEffects(
 
 async function fetchEffectPage(
     transport: RpcTransport,
-    page: {id: number; offset: number}
+    page: {id: number; offset: number},
+    signal?: AbortSignal
 ): Promise<unknown[]> {
-    const r = await transport.sendRPC('LedStrip.ListAllEffects', page);
+    const r = await transport.sendRPC(
+        'LedStrip.ListAllEffects',
+        page,
+        false,
+        probeSignal(signal)
+    );
     const effects = (r as {effects?: unknown})?.effects;
     return Array.isArray(effects) ? effects : [];
 }

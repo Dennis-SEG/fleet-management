@@ -972,6 +972,13 @@ export interface TuningConfig {
         probeConcurrency: number;
         /** Heavier gather (paginated components) fan-out cap (default: 50). */
         gatherConcurrency: number;
+        /** Hard deadline for one gather, every probe RPC included (default:
+         * 45s). Keep it under device.initSlotMaxHoldMs so a slow gather is
+         * given up on before the init-slot watchdog reclaims the slot. */
+        gatherMaxMs: number;
+        /** How long an accept waits on an already-running gather before
+         * abandoning it and probing fresh (default: 15s). */
+        gatherTakeMs: number;
     };
     ws: {
         /** Max queued WS messages from a client during token validation (default: 25) */
@@ -2590,6 +2597,8 @@ function readTuning(): TuningConfig {
             ),
             probeConcurrency: envInt('FM_WAITING_PROBE_CONCURRENCY', 50, 1),
             gatherConcurrency: envInt('FM_WAITING_GATHER_CONCURRENCY', 50, 1),
+            gatherMaxMs: envInt('FM_WAITING_GATHER_MAX_MS', 45_000, 1_000),
+            gatherTakeMs: envInt('FM_WAITING_GATHER_TAKE_MS', 15_000, 1_000),
             max: envInt('FM_WAITING_ROOM_MAX', 2_000, 1),
             ttlMs: envInt('FM_WAITING_ROOM_TTL_MS', 3_600_000, 1_000),
             sweepMs: envInt('FM_WAITING_ROOM_SWEEP_MS', 60_000, 1_000),
