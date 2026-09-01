@@ -30,6 +30,12 @@ export default abstract class RpcTransport {
     #shellyMessageMap = new Map<number, StoredMessage>();
     #uniqueID = 0;
     #intervalId: NodeJS.Timeout;
+    // Set by destroy(). A send after teardown can never be answered: the
+    // socket is gone (ws.send() is a silent no-op once closed — no throw for
+    // #failPending to catch) and destroy() has already stopped the stale
+    // sweeper, so the pending slot would sit there forever and its caller
+    // would await a promise nothing can settle.
+    #destroyed = false;
     protected _messageListeners: ShellyResponseCallback[] = [];
     protected _eventEmitter: ShellyDeviceEmitter;
 
@@ -88,6 +94,9 @@ export default abstract class RpcTransport {
         emitMessage = false,
         signal?: AbortSignal
     ) {
+        if (this.#destroyed) {
+            return Promise.reject(RpcError.Timeout());
+        }
         if (signal?.aborted) {
             return Promise.reject(signal.reason ?? new Error('aborted'));
         }
@@ -235,6 +244,9 @@ export default abstract class RpcTransport {
     }
 
     public destroy() {
+        // Before rejecting: a handler that reacts by issuing another RPC must
+        // fail fast rather than register a slot that outlives the sweeper.
+        this.#destroyed = true;
         const error = RpcError.Timeout();
         for (const handler of this.#shellyMessageMap.values()) {
             handler.cleanup?.();
